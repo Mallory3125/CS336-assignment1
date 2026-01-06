@@ -48,9 +48,9 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-
+filename = './data/TinyStoriesV2-GPT4-valid.txt'
 ## Usage
-with open(..., "rb") as f:
+with open(filename, "rb") as f:
     num_processes = 4
     boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
 
