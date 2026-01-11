@@ -372,4 +372,4 @@ if __name__ == '__main__':
     # for i, (key, value) in enumerate(result.items()):
     #     if i < 3:  
     #         print(f"{key}: {value}")
-    vocab, merges = run_train_bpe(filename,vocab_size,special_tokens, num_process)
+    vocab, merges = train_bpe_tokenizer(filename,vocab_size,special_tokens, num_process)
