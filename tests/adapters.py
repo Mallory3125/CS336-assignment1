@@ -591,7 +591,7 @@ def run_train_bpe(
                 Merges are ordered by order of creation.
     """
     
-    vocab, merges = run_train_bpe(
+    vocab, merges = train_bpe_tokenizer(
         input_path,vocab_size,special_tokens
         )
     return vocab, merges

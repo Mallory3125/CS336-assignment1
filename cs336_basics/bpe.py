@@ -8,6 +8,82 @@ from multiprocessing import Pool
 #gpt-2 style regex-based pre-tokenizer
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
+
+def merge_bpe_fast(
+    frequency_table: dict[tuple[bytes], int], 
+    vocab_size: int,
+    num_tokens: int
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """Highly optimized BPE merging with minimal allocations."""
+    vocab = {idx: bytes([idx]) for idx in range(256)}
+    next_token_id = 256
+    merges = []
+    max_merges = vocab_size - next_token_id - num_tokens
+    
+    # Use defaultdict instead of Counter
+    pair_counts = defaultdict(int)
+    for token_seq, freq in frequency_table.items():
+        for i in range(len(token_seq) - 1):
+            pair = (token_seq[i], token_seq[i + 1])
+            pair_counts[pair] += freq
+    
+    word_cnt = dict(frequency_table)
+    
+    for merge_iteration in range(max_merges):
+        if not pair_counts:
+            break
+        
+        most_frequent_pair = max(pair_counts.items(), 
+                                key=lambda x: (x[1], x[0]))[0]
+        token_a, token_b = most_frequent_pair
+        
+        merged_token = token_a + token_b
+        vocab[next_token_id] = merged_token
+        merges.append((token_a, token_b))
+        
+        new_word_cnt = {}
+        
+        for word_bytes, cnt in word_cnt.items():
+            # Single-pass check
+            has_merge = any(word_bytes[i] == token_a and word_bytes[i+1] == token_b 
+                          for i in range(len(word_bytes) - 1))
+            
+            if not has_merge:
+                new_word_cnt[word_bytes] = cnt
+                continue
+            
+            # Decrement old pairs
+            for i in range(len(word_bytes) - 1):
+                pair = (word_bytes[i], word_bytes[i + 1])
+                pair_counts[pair] -= cnt
+                if pair_counts[pair] == 0:
+                    del pair_counts[pair]
+            
+            # Apply merge
+            new_word = []
+            i = 0
+            while i < len(word_bytes):
+                if (i < len(word_bytes) - 1 and 
+                    word_bytes[i] == token_a and word_bytes[i + 1] == token_b):
+                    new_word.append(merged_token)
+                    i += 2
+                else:
+                    new_word.append(word_bytes[i])
+                    i += 1
+            
+            new_word = tuple(new_word)
+            new_word_cnt[new_word] = cnt
+            
+            # Add new pairs
+            for i in range(len(new_word) - 1):
+                pair_counts[(new_word[i], new_word[i + 1])] += cnt
+        
+        word_cnt = new_word_cnt
+        next_token_id += 1
+    
+    return vocab, merges
+
+
 def merge_bpe_optimized(
     frequency_table: dict[tuple[bytes], int], 
     vocab_size: int,
@@ -15,7 +91,16 @@ def merge_bpe_optimized(
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """
     Optimized BPE merging with incremental pair count updates.
-    """    
+    
+    Args:
+        frequency_table: Dictionary mapping token sequences to their frequencies
+        vocab_size: Target vocabulary size
+        num_tokens: Number of special tokens to reserve space for
+    
+    Returns:
+        vocab: Dictionary mapping token IDs to byte sequences
+        merges: List of merge operations as (token_a, token_b) pairs
+    """
     # Initialize vocabulary with base bytes (0-255)
     vocab = {idx: bytes([idx]) for idx in range(256)}
     next_token_id = 256
@@ -23,29 +108,24 @@ def merge_bpe_optimized(
     merges = []
     max_merges = vocab_size - next_token_id - num_tokens
     
-    # Build initial pair counts index
+    # Build initial pair counts from frequency table
     pair_counts = Counter()
     for token_seq, freq in frequency_table.items():
         for i in range(len(token_seq) - 1):
             pair = (token_seq[i], token_seq[i + 1])
             pair_counts[pair] += freq
     
-    # Keep track of where each pair appears
-    pair_positions = defaultdict(set)
-    for seq_id, (token_seq, freq) in enumerate(frequency_table.items()):
-        for i in range(len(token_seq) - 1):
-            pair = (token_seq[i], token_seq[i + 1])
-            pair_positions[pair].add(seq_id)
+    # Keep word count dictionary for incremental updates
+    word_cnt = dict(frequency_table)
     
-    # Convert dict to list for mutable indexing
-    sequence_list = list(frequency_table.items())
-    
+    # Perform merges
     for merge_iteration in range(max_merges):
         if not pair_counts:
             break
         
-        # Find most frequent pair
-        most_frequent_pair, count = pair_counts.most_common(1)[0]
+        # Find most frequent pair with lexicographic tie-breaking
+        most_frequent_pair = max(pair_counts.items(), 
+                                key=lambda x: (x[1], x[0]))[0]
         token_a, token_b = most_frequent_pair
         
         # Create new merged token
@@ -53,54 +133,53 @@ def merge_bpe_optimized(
         vocab[next_token_id] = merged_token
         merges.append((token_a, token_b))
         
-        # Update only affected sequences
-        sequences_to_update = pair_positions[most_frequent_pair]
-        new_pair_counts = Counter()
+        # Incrementally update only affected sequences
+        new_word_cnt = {}
+        new_pair_counts = Counter(pair_counts)  # Copy current counts
         
-        for seq_id in sequences_to_update:
-            token_seq, freq = sequence_list[seq_id]
+        for word_bytes, cnt in word_cnt.items():
+            # Get all pairs in this word
+            old_pairs = list(zip(word_bytes[:-1], word_bytes[1:]))
             
-            # Remove old pair counts for this sequence
-            for i in range(len(token_seq) - 1):
-                old_pair = (token_seq[i], token_seq[i + 1])
-                pair_counts[old_pair] -= freq
-                if pair_counts[old_pair] <= 0:
-                    del pair_counts[old_pair]
+            # Skip words that don't contain the merged pair
+            if most_frequent_pair not in old_pairs:
+                new_word_cnt[word_bytes] = cnt
+                continue
             
-            # Perform merge in this sequence
-            new_seq = []
+            # Apply merge to this word
+            new_word = []
             i = 0
-            while i < len(token_seq):
-                if (i < len(token_seq) - 1 and 
-                    token_seq[i] == token_a and 
-                    token_seq[i + 1] == token_b):
-                    new_seq.append(merged_token)
+            while i < len(word_bytes):
+                if (i < len(word_bytes) - 1 and 
+                    word_bytes[i] == token_a and 
+                    word_bytes[i + 1] == token_b):
+                    new_word.append(merged_token)
                     i += 2
                 else:
-                    new_seq.append(token_seq[i])
+                    new_word.append(word_bytes[i])
                     i += 1
             
-            # Update sequence
-            sequence_list[seq_id] = (tuple(new_seq), freq)
+            new_word = tuple(new_word)
+            new_word_cnt[new_word] = cnt
             
-            # Add new pair counts for this sequence
-            for i in range(len(new_seq) - 1):
-                new_pair = (new_seq[i], new_seq[i + 1])
-                new_pair_counts[new_pair] += freq
+            # Update pair counts: subtract old pairs
+            for pair in old_pairs:
+                new_pair_counts[pair] -= cnt
+                if new_pair_counts[pair] <= 0:
+                    del new_pair_counts[pair]
+            
+            # Update pair counts: add new pairs
+            new_pairs = list(zip(new_word[:-1], new_word[1:]))
+            for pair in new_pairs:
+                new_pair_counts[pair] += cnt
         
-        # Update global pair counts
-        pair_counts.update(new_pair_counts)
-        
-        # Rebuild pair positions index for affected pairs
-        pair_positions.clear()
-        for seq_id, (token_seq, freq) in enumerate(sequence_list):
-            for i in range(len(token_seq) - 1):
-                pair = (token_seq[i], token_seq[i + 1])
-                pair_positions[pair].add(seq_id)
-        
+        # Update state for next iteration
+        word_cnt = new_word_cnt
+        pair_counts = new_pair_counts
         next_token_id += 1
     
     return vocab, merges
+
 
 def pre_tokenize(
     chunks: list[bytes],
@@ -244,7 +323,7 @@ def parallel_process_chunks(
     return dict(merged_freq)
 
 
-def run_train_bpe(
+def train_bpe_tokenizer(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
@@ -262,7 +341,7 @@ def run_train_bpe(
     )
     
     # Step 2: Sequential merging (no special tokens involved)
-    vocab, merges = merge_bpe_optimized(
+    vocab, merges = merge_bpe_fast(
         token_frequencies,
         vocab_size,
         len(special_tokens_bytes)
@@ -277,35 +356,6 @@ def run_train_bpe(
     return vocab, merges
 
 
-def train_bpe_tokenizer(
-    input_path: str,
-    vocab_size: int,
-    special_tokens: list[str]
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]: # type: ignore
-    """
-    Train a Byte Pair Encoding (BPE) tokenizer.
-    
-    Args:
-        input_path: Path to training text file
-        vocab_size: Maximum vocabulary size (including base bytes, merges, and special tokens)
-        special_tokens: List of special token strings to add to vocabulary
-        
-    Returns:
-        vocab: Mapping from token ID to token bytes
-        merges: Ordered list of merge operations as (byte_pair_a, byte_pair_b) tuples
-    """
-    with open(input_path, "rb") as f:
-        num_processes = 4
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-
-        # The following is a serial implementation, but you can parallelize this
-        # by sending each start/end pair to a set of processes.
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore")
-            print(start, end)
-
-    pass
 
 if __name__ == '__main__':
     filename = './data/TinyStoriesV2-GPT4-valid_short.txt'
